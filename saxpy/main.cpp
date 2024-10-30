@@ -19,7 +19,7 @@ int main(int argc, char** argv)
 {
 
     // default: arrays of 100M numbers
-    int N = 100 * 1000 * 1000;
+    int N = 20 * 1000 * 1000;
 
     // parse commandline options ////////////////////////////////////////////
     int opt;

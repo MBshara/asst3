@@ -368,10 +368,18 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     float4 existingColor = *imagePtr;
     float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x; // saxpy
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y; // saxpy
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z; // saxpy
     newColor.w = alpha + existingColor.w;
+
+    // need to save 
+    // alpha - float
+    // rgb - float3
+    // float4 total same as image pointer
+
+    // *imagePtr can be changed to some local
+
 
     // global memory write
     *imagePtr = newColor;
@@ -427,6 +435,46 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+__global__ void kernelRenderCircle(int circle_num) {
+    int index3 = 3 * circle_num;
+
+    int pixel_altered = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // if (index >= cuConstRendererParams.numCircles)
+    //     return;
+
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float  rad = cuConstRendererParams.radius[circle_num];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    if (pixel_altered >= ((screenMaxX-screenMinX)*(screenMaxY-screenMinY))) {
+        return;
+    }
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * ((pixel_altered/screenMaxY) * imageWidth + screenMinX)]) + pixel_altered%screenMaxX;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
+    shadePixel(circle_num, pixelCenterNorm, p, imgPtr);
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -636,10 +684,25 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // // 256 threads per block is a healthy number
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
+
+    // // Compute how many pixels each circle takes up and save it into a local data structure
+    // numOfPixels<<blockDim,gridDim>>();
+    // cudaDeviceSynchronize(); // maybe
+    // cudaMemcpy(&host_var, &device_var, length*sizeof(int), cudaMemcpyDeviceToHost);
+    //
+    dim3 blockDim(256, 1);
+    dim3 gridDim(
+        (image->width*image->height + blockDim.x - 1) / blockDim.x);
+
+    for(int i = 0; i<numCircles; i++){
+        // num_of_threads = host_var[i];
+        kernelRenderCircle<<<gridDim, blockDim>>>(i);
+        cudaDeviceSynchronize(); //maybe
+    }
 }

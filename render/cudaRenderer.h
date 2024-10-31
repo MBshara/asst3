@@ -20,7 +20,9 @@ private:
     float* velocity;
     float* color;
     float* radius;
+    int* pixelsPerCircle;
 
+    int* cudaPixelsPerCircle;
     float* cudaDevicePosition;
     float* cudaDeviceVelocity;
     float* cudaDeviceColor;

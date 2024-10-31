@@ -476,6 +476,37 @@ __global__ void kernelRenderCircle(int circle_num) {
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
     shadePixel(circle_num, pixelCenterNorm, p, imgPtr);
 }
+
+__global__ void 
+numOfPixels{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index >= cuConstRendererParams.numCircles)
+        return;
+
+    int index3 = 3 * index;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float  rad = cuConstRendererParams.radius[index];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    cudaPixelsPerCircle[index] = (screenMaxX-screenMinX)*(screenMaxY-screenMinY);
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -487,7 +518,9 @@ CudaRenderer::CudaRenderer() {
     velocity = NULL;
     color = NULL;
     radius = NULL;
+    pixelsPerCircle = NULL;
 
+    cudaPixelsPerCircle = NULL;
     cudaDevicePosition = NULL;
     cudaDeviceVelocity = NULL;
     cudaDeviceColor = NULL;
@@ -506,11 +539,13 @@ CudaRenderer::~CudaRenderer() {
         delete [] velocity;
         delete [] color;
         delete [] radius;
+        delete [] pixelsPerCircle;
     }
 
     if (cudaDevicePosition) {
         cudaFree(cudaDevicePosition);
         cudaFree(cudaDeviceVelocity);
+        cudaFree(cudaPixelsPerCircle);
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
@@ -568,7 +603,8 @@ CudaRenderer::setup() {
     //
     // See the CUDA Programmer's Guide for descriptions of
     // cudaMalloc and cudaMemcpy
-
+    pixelsPerCircle = new int[numCircles];
+    cudaMalloc(&cudaPixelsPerCircle, sizeof(int) * numCircles);
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
@@ -692,18 +728,21 @@ CudaRenderer::render() {
     // kernelRenderCircles<<<gridDim, blockDim>>>();
     // cudaDeviceSynchronize();
 
-    // // Compute how many pixels each circle takes up and save it into a local data structure
-    // numOfPixels<<blockDim,gridDim>>();
-    // cudaDeviceSynchronize(); // maybe
-    // cudaMemcpy(&host_var, &device_var, length*sizeof(int), cudaMemcpyDeviceToHost);
-    //
     dim3 blockDim(256, 1);
-    dim3 gridDim(
-        (image->width*image->height + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+
+    // New
+    // Compute how many pixels each circle takes up and save it into a local data structure
+    numOfPixels<<<gridDim, blockDim>>>();
+    cudaDeviceSynchronize();
+    cudaMemcpy(&pixelsPerCircle, &cudaPixelsPerCircle, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
 
     for(int i = 0; i<numCircles; i++){
-        // num_of_threads = host_var[i];
-        kernelRenderCircle<<<gridDim, blockDim>>>(i);
+        dim3 blockDimCircle(256, 1);
+        dim3 gridDimCircle((pixelsPerCircle[i] + blockDimCircle.x - 1) / blockDimCircle.x);
+        kernelRenderCircle<<<gridDimCircle, blockDimCircle>>>(i);
         cudaDeviceSynchronize(); //maybe
     }
 }

@@ -478,7 +478,7 @@ __global__ void kernelRenderCircle(int circle_num) {
 }
 
 __global__ void 
-numOfPixels{
+numOfPixels(int* cudaPixelsPerCircle){
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (index >= cuConstRendererParams.numCircles)
@@ -733,9 +733,9 @@ CudaRenderer::render() {
 
     // New
     // Compute how many pixels each circle takes up and save it into a local data structure
-    numOfPixels<<<gridDim, blockDim>>>();
+    numOfPixels<<<gridDim, blockDim>>>(cudaPixelsPerCircle);
     cudaDeviceSynchronize();
-    cudaMemcpy(&pixelsPerCircle, &cudaPixelsPerCircle, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(pixelsPerCircle, cudaPixelsPerCircle, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
 
 

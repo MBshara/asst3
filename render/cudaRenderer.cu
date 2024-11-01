@@ -620,7 +620,6 @@ rendering(int circles_left, int iter){
         float boxB = max(blockIdx.y * blockDim.y + 0.0,0.0);
         float boxR = min(boxL + blockDim.x, 1024.0); 
         float boxT = min(boxB + blockDim.y, 1024.0);
-
         shared_p[real_id] = p;
         shared_rad[real_id] = rad;
         existence[real_id] = circleInBox(p.x,p.y, rad, invWidth * boxL, invWidth * boxR, invHeight * boxT, invHeight * boxB);
@@ -648,6 +647,67 @@ rendering(int circles_left, int iter){
         }
         *imgPtr = temp;
     }
+}
+
+__global__ void
+rendering_2(int total_circles, int iterations){
+    // x,y pixel I am computing on;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    __shared__ float3 shared_p[SCAN_BLOCK_DIM];  // Shared memory for positions
+    __shared__ float shared_rad[SCAN_BLOCK_DIM]; // Shared memory for radii
+    __shared__ uint existence[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint realOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    int real_id = threadIdx.x + threadIdx.y * blockDim.x; // Between 0-255
+    float boxL = max(blockIdx.x * blockDim.x + 0.0,0.0);
+    float boxB = max(blockIdx.y * blockDim.y + 0.0,0.0);
+    float boxR = min(boxL + blockDim.x, 1024.0); 
+    float boxT = min(boxB + blockDim.y, 1024.0);
+    boxL = invWidth * boxL;
+    boxR = invWidth * boxR;
+    boxT = invHeight * boxT;
+    boxB = invHeight * boxB;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]) + pixelX;
+    float4 temp = *imgPtr;
+    for(int iter = 0; i<iterations; iter++){
+        int circle_id = iter*SCAN_BLOCK_DIM + real_id;
+        if(circle_id < total_circles){
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * circle_id]);
+            float rad = cuConstRendererParams.radius[circle_id];
+            shared_p[real_id] = p;
+            shared_rad[real_id] = rad;
+            existence[real_id] = circleInBox(p.x, p.y, rad,  boxL, boxR, boxT, boxB);
+        }
+        else{
+            existence[real_id] = 0;
+        }
+        prefixSumScratch[real_id] = 0;
+        prefixSumScratch[real_id+SCAN_BLOCK_DIM] = 0;
+        prefixSumOutput[real_id] = 0;
+        realOutput[real_id]=0;
+        __syncthreads();
+        sharedMemExclusiveScan(real_id, existence, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+        d_GatherIndices(real_id, prefixSumOutput, SCAN_BLOCK_DIM, existence, realOutput);
+        __syncthreads();
+        int result = prefixSumOutput[SCAN_BLOCK_DIM-1] + existence[SCAN_BLOCK_DIM-1];
+        if(result>0){
+            for(int i = 0; i < result; i++){
+                shadePixel_2(realOutput[i]+iter*SCAN_BLOCK_DIM, pixelCenterNorm, shared_p[realOutput[i]],&temp, shared_rad[realOutput[i]]);
+            }
+        }
+        __syncthreads();
+    }
+    *imgPtr = temp;
 }
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -875,18 +935,27 @@ CudaRenderer::render() {
 
     dim3 blockDim(32, 32, 1);
     dim3 gridDim(32,32);
-    // int circles_left= (numCircles<=256) ? numCircles : 256;
-    for(int i = 0; i< (numCircles+SCAN_BLOCK_DIM)/SCAN_BLOCK_DIM; i++){
-        
-        int circles_left = SCAN_BLOCK_DIM*i>(numCircles-SCAN_BLOCK_DIM) ? numCircles%SCAN_BLOCK_DIM : SCAN_BLOCK_DIM;
-        rendering<<<gridDim, blockDim>>>(circles_left, i);
-        cudaError_t error = cudaGetLastError();
-        if (error != cudaSuccess) {
-            printf("CUDA error: %s\n", cudaGetErrorString(error));
-            fflush(stdout);
-        }
-        cudaDeviceSynchronize();
+
+    int iterations = (numCircles+SCAN_BLOCK_DIM)/SCAN_BLOCK_DIM;
+    rendering_2<<<gridDim, blockDim>>>(numCircles, iterations);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error: %s\n", cudaGetErrorString(error));
+        fflush(stdout);
     }
+    cudaDeviceSynchronize();
+
+    // for(int i = 0; i< (numCircles+SCAN_BLOCK_DIM)/SCAN_BLOCK_DIM; i++){
+        
+    //     int circles_left = SCAN_BLOCK_DIM*i>(numCircles-SCAN_BLOCK_DIM) ? numCircles%SCAN_BLOCK_DIM : SCAN_BLOCK_DIM;
+    //     rendering<<<gridDim, blockDim>>>(circles_left, i);
+    //     cudaError_t error = cudaGetLastError();
+    //     if (error != cudaSuccess) {
+    //         printf("CUDA error: %s\n", cudaGetErrorString(error));
+    //         fflush(stdout);
+    //     }
+    //     cudaDeviceSynchronize();
+    // }
 
     // Why use subgrids?
     //  Well the two naive approaches to ensure circle ordering are:

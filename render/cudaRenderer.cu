@@ -507,6 +507,65 @@ numOfPixels(int* cudaPixelsPerCircle){
 
     cudaPixelsPerCircle[index] = (screenMaxX-screenMinX)*(screenMaxY-screenMinY);
 }
+
+__global__ void
+d_GatherIndices(int index, uint* input, int length, uint* output){
+    
+    if (index<length-1){
+        if((input[index]!=input[index+1])){
+            output[input[index]] = index;
+        }
+    }
+}
+
+__global__ void
+rendering(int numCircles, int iter){
+    // x,y pixel I am computing on;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    __shared__ float3 shared_p[256];  // Shared memory for positions
+    __shared__ float shared_rad[256]; // Shared memory for radii
+    __shared__ uint existence[256];
+    __shared__ uint prefixSumOutput[256];
+    __shared__ uint realOutput[256];
+    __shared__ uint prefixSumScratch[2 * 256];
+    __shared__ short imageWidth;
+    __shared__ short imageHeight;
+    int real_id = threadIdx.x + threadIdx.y * blockDim.x; // Between 0-255
+    if(real_id< numCircles){
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * iter * 256 + real_id]);
+        float rad = cuConstRendererParams.radius[iter * 256 + real_id];
+        int boxL = blockIdx.x * blockDim.x;
+        int boxT = blockIdx.y * blockDim.y;
+        int boxR = min(x_start + blockDim.x, 1024); 
+        int boxB = min(y_start + blockDim.y, 1024);
+        shared_p[real_id] = p;
+        shared_rad[real_id] = rad;
+        existence[real_id] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, bobB);
+    }
+    else{
+        existence[real_id] = 0;
+    }
+    __syncthreads();
+    sharedMemExclusiveScan(real_id, existence, prefixSumOutput, prefixSumScratch, 256);
+    __syncthreads();
+    d_GatherIndices(real_id, prefixSumOutput, 256, realOutput);
+    __syncthreads();
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    int result = prefixSumOutput[255];
+    if(result>0){
+        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                    invHeight * (static_cast<float>(pixelY) + 0.5f));
+        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]) + pixelX;
+        for(int i = 0; i < result; i++){
+            shadePixel(realOutput[i], pixelCenterNorm, shared_p[realOutput[i]],imgPtr);
+        }
+    }
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -728,21 +787,67 @@ CudaRenderer::render() {
     // kernelRenderCircles<<<gridDim, blockDim>>>();
     // cudaDeviceSynchronize();
 
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // Seperate 1024 x 1024 into 1024/sub_grid_height x 1024/sub_grid_height distinct sub_grid_heightxsub_grid_height grids
+    int subgrid_height = 16;
+
+    dim3 blockDim(subgrid_height, subgrid_height);
+    dim3 gridDim((1024 + blockDim.x - 1) / blockDim.x,
+             (1024 + blockDim.y - 1) / blockDim.y);
+    for(int i = 0; i< numCircles/256 + 1; i++){
+        rendering<<<gridDim, blockDim>>>(numCircles, i);
+        cudaDeviceSynchronize();
+    }
+
+    // Why use subgrids?
+    //  Well the two naive approaches to ensure circle ordering are:
+    //      - Circle Centric: Compute each circle serially(many threads working on the same circle)
+    //      - Pixel Centric: Figure out which circles map to a specific pixel and have one thread do the work for each pixel.
+    //  In the circle centric case, it is data efficient as once you are done with one's circle data you are done with it forever, but
+    //      the slow global memory of retrieving existing color to update the pixel will not be data efficient. Another issue is that 
+    //      it becomes quite hard to figure out which circles can be computed at the same time as you would need a large dependency graph
+    //      and even if we had enought data to compute this dependency graph, executing the rendering of circles in a optimal GPU utilization 
+    //      manner is very difficult.
+    //  In the pixel centric case, it is data efficient when it comes to pixel updates. If we give 1 thread per pixel than the local updates
+    //      can be stored in the local memory of each thread, thus the minimal number of reads and writes are needed minimizing data
+    //      transfer. The issue lies is that doing the computation of all circles on a specific pixel can be quite slow as some circles
+    //      will never need to be touched. If we were to keep track of all the circles that are touched by this pixel this could and
+    //      and would create much more memory than the GPU can store in global memory.
+    //  So we like the circle data efficiency presented in the first approach but scaling becomes an issue!
+    //  So lets increase the granurality of the pixel centric approach to grid centric:
+    
+    //  Grid centric approach divides the total image into subgrids. Each subgrid figures out what circles could be inside its area.
+    //      Then we do the pixel level computation in the subgrid which is thread per pixel to ensure circle ordering
+    // Step 1, Figuring out what circles belong to each subgrid.
+    //  Two ways I see doing this:
+    //      - We ask each circle where does it belong.
+    //      - We ask each subgrid what circles exist inside you.
+    //  In the "asking each circle approach", assign a block to each circle. Each circle will have an array of shared memory of size subgrids.
+    //      We figure out which subgrid the circlee lies in by giving a 0 in an array if it does lie there and a 1 if it doesn't.
+    //      We can then run an efficient exclusive scan on this in shared memory to generate a list of "known" size and the indices of
+    //      the subgrids where the circles are computed. Positives: shared memory easy, no mem reuse. Issues: how do I translate
+    //      from circle perspective to region perspective.
+    //  In the "asking each region approach", we assign a block to each region. Each region will compute on all the circles and figure
+    //      out which circles lie in the region. We can do this in a similar fashion to the previous approach, but it is more straightforward
+    //      as when the region has finished computing. This can be put into global memory, but is much larger, so might need many pass
+    //      many passtrhoughs. Positives: translating perspective to actual shader calculation is simple. Negatives: data reuse for circles.
+
+
+
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
     // New
     // Compute how many pixels each circle takes up and save it into a local data structure
-    numOfPixels<<<gridDim, blockDim>>>(cudaPixelsPerCircle);
-    cudaDeviceSynchronize();
-    cudaMemcpy(pixelsPerCircle, cudaPixelsPerCircle, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
+    // numOfPixels<<<gridDim, blockDim>>>(cudaPixelsPerCircle);
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(pixelsPerCircle, cudaPixelsPerCircle, numCircles*sizeof(int), cudaMemcpyDeviceToHost);
+    // cudaDeviceSynchronize();
 
 
-    for(int i = 0; i<numCircles; i++){
-        dim3 blockDimCircle(256, 1);
-        dim3 gridDimCircle((pixelsPerCircle[i] + blockDimCircle.x - 1) / blockDimCircle.x);
-        kernelRenderCircle<<<gridDimCircle, blockDimCircle>>>(i);
-        cudaDeviceSynchronize(); //maybe
-    }
+    // for(int i = 0; i<numCircles; i++){
+    //     dim3 blockDimCircle(256, 1);
+    //     dim3 gridDimCircle((pixelsPerCircle[i] + blockDimCircle.x - 1) / blockDimCircle.x);
+    //     kernelRenderCircle<<<gridDimCircle, blockDimCircle>>>(i);
+    //     cudaDeviceSynchronize(); //maybe
+    // }
 }

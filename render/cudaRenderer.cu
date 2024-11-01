@@ -14,6 +14,10 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define SCAN_BLOCK_DIM   256
+#include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -508,61 +512,69 @@ numOfPixels(int* cudaPixelsPerCircle){
     cudaPixelsPerCircle[index] = (screenMaxX-screenMinX)*(screenMaxY-screenMinY);
 }
 
-__global__ void
-d_GatherIndices(int index, uint* input, int length, uint* output){
+__device__ void
+d_GatherIndices(int index, uint* input, int length, uint* input2, uint* output){
     
     if (index<length-1){
         if((input[index]!=input[index+1])){
             output[input[index]] = index;
         }
     }
+    else{
+        if(input2[index]==1){
+            output[input[index]] = index;
+        }
+    }
 }
 
 __global__ void
-rendering(int numCircles, int iter){
+rendering(int circles_left, int iter){
     // x,y pixel I am computing on;
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
     __shared__ float3 shared_p[256];  // Shared memory for positions
-    __shared__ float shared_rad[256]; // Shared memory for radii
+    // __shared__ float shared_rad[256]; // Shared memory for radii
     __shared__ uint existence[256];
     __shared__ uint prefixSumOutput[256];
     __shared__ uint realOutput[256];
     __shared__ uint prefixSumScratch[2 * 256];
-    __shared__ short imageWidth;
-    __shared__ short imageHeight;
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
     int real_id = threadIdx.x + threadIdx.y * blockDim.x; // Between 0-255
-    if(real_id< numCircles){
-        float3 p = *(float3*)(&cuConstRendererParams.position[3 * iter * 256 + real_id]);
+    if(real_id < circles_left){
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * (iter * 256 + real_id)]);
         float rad = cuConstRendererParams.radius[iter * 256 + real_id];
-        int boxL = blockIdx.x * blockDim.x;
-        int boxT = blockIdx.y * blockDim.y;
-        int boxR = min(x_start + blockDim.x, 1024); 
-        int boxB = min(y_start + blockDim.y, 1024);
+        float boxL = max(blockIdx.x * blockDim.x + 0.0,0.0);
+        float boxB = max(blockIdx.y * blockDim.y + 0.0,0.0);
+        float boxR = min(boxL + blockDim.x, 1024.0); 
+        float boxT = min(boxB + blockDim.y, 1024.0);
+
         shared_p[real_id] = p;
-        shared_rad[real_id] = rad;
-        existence[real_id] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, bobB);
+        // shared_rad[real_id] = rad;
+        existence[real_id] = circleInBoxConservative(p.x,p.y, rad, invWidth * boxL, invWidth * boxR, invHeight * boxT, invHeight * boxB);
     }
     else{
         existence[real_id] = 0;
     }
     __syncthreads();
     sharedMemExclusiveScan(real_id, existence, prefixSumOutput, prefixSumScratch, 256);
+    //  if(blockIdx.x == 63 && blockIdx.y == 63){
+    //         printf("pSum%i\n",prefixSumOutput[real_id]);
+    //     }
     __syncthreads();
-    d_GatherIndices(real_id, prefixSumOutput, 256, realOutput);
+    d_GatherIndices(real_id, prefixSumOutput, 256, existence, realOutput);
     __syncthreads();
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-    int result = prefixSumOutput[255];
+    int result = prefixSumOutput[255] + existence[255];
+
     if(result>0){
         float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                     invHeight * (static_cast<float>(pixelY) + 0.5f));
         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]) + pixelX;
         for(int i = 0; i < result; i++){
-            shadePixel(realOutput[i], pixelCenterNorm, shared_p[realOutput[i]],imgPtr);
+            shadePixel(realOutput[i]+iter*256, pixelCenterNorm, shared_p[realOutput[i]],imgPtr);
         }
     }
 }
@@ -788,13 +800,20 @@ CudaRenderer::render() {
     // cudaDeviceSynchronize();
 
     // Seperate 1024 x 1024 into 1024/sub_grid_height x 1024/sub_grid_height distinct sub_grid_heightxsub_grid_height grids
-    int subgrid_height = 16;
+    // int subgrid_height = 16;
 
-    dim3 blockDim(subgrid_height, subgrid_height);
-    dim3 gridDim((1024 + blockDim.x - 1) / blockDim.x,
-             (1024 + blockDim.y - 1) / blockDim.y);
-    for(int i = 0; i< numCircles/256 + 1; i++){
-        rendering<<<gridDim, blockDim>>>(numCircles, i);
+    dim3 blockDim(16, 16, 1);
+    dim3 gridDim(64,64);
+    // int circles_left= (numCircles<=256) ? numCircles : 256;
+    for(int i = 0; i< (numCircles+256)/256; i++){
+        
+        int circles_left = 256*i>(numCircles-256) ? numCircles%256 : 256;
+        rendering<<<gridDim, blockDim>>>(circles_left, i);
+        cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            printf("CUDA error: %s\n", cudaGetErrorString(error));
+            fflush(stdout);
+        }
         cudaDeviceSynchronize();
     }
 

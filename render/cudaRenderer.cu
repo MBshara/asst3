@@ -678,7 +678,11 @@ rendering_2(int total_circles, int iterations){
                                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]) + pixelX;
     float4 temp = *imgPtr;
-    for(int iter = 0; i<iterations; iter++){
+    float4 old_temp = temp;
+    for(int iter = 0; iter<iterations; iter++){
+        if(iter!=0){
+            __syncthreads();
+        }
         int circle_id = iter*SCAN_BLOCK_DIM + real_id;
         if(circle_id < total_circles){
             float3 p = *(float3*)(&cuConstRendererParams.position[3 * circle_id]);
@@ -690,10 +694,6 @@ rendering_2(int total_circles, int iterations){
         else{
             existence[real_id] = 0;
         }
-        prefixSumScratch[real_id] = 0;
-        prefixSumScratch[real_id+SCAN_BLOCK_DIM] = 0;
-        prefixSumOutput[real_id] = 0;
-        realOutput[real_id]=0;
         __syncthreads();
         sharedMemExclusiveScan(real_id, existence, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
         __syncthreads();
@@ -702,12 +702,14 @@ rendering_2(int total_circles, int iterations){
         int result = prefixSumOutput[SCAN_BLOCK_DIM-1] + existence[SCAN_BLOCK_DIM-1];
         if(result>0){
             for(int i = 0; i < result; i++){
-                shadePixel_2(realOutput[i]+iter*SCAN_BLOCK_DIM, pixelCenterNorm, shared_p[realOutput[i]],&temp, shared_rad[realOutput[i]]);
+                shadePixel_2(realOutput[i]+iter*SCAN_BLOCK_DIM, pixelCenterNorm, shared_p[realOutput[i]], &temp, shared_rad[realOutput[i]]);
             }
         }
-        __syncthreads();
     }
-    *imgPtr = temp;
+    // Good for micro
+    // if(old_temp.x!=temp.x || old_temp.y!=temp.y || old_temp.z!=temp.z || old_temp.y!=temp.w){ 
+        *imgPtr = temp;
+    // }
 }
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -720,9 +722,7 @@ CudaRenderer::CudaRenderer() {
     velocity = NULL;
     color = NULL;
     radius = NULL;
-    pixelsPerCircle = NULL;
 
-    cudaPixelsPerCircle = NULL;
     cudaDevicePosition = NULL;
     cudaDeviceVelocity = NULL;
     cudaDeviceColor = NULL;
@@ -741,13 +741,11 @@ CudaRenderer::~CudaRenderer() {
         delete [] velocity;
         delete [] color;
         delete [] radius;
-        delete [] pixelsPerCircle;
     }
 
     if (cudaDevicePosition) {
         cudaFree(cudaDevicePosition);
         cudaFree(cudaDeviceVelocity);
-        cudaFree(cudaPixelsPerCircle);
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
@@ -805,8 +803,6 @@ CudaRenderer::setup() {
     //
     // See the CUDA Programmer's Guide for descriptions of
     // cudaMalloc and cudaMemcpy
-    pixelsPerCircle = new int[numCircles];
-    cudaMalloc(&cudaPixelsPerCircle, sizeof(int) * numCircles);
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
@@ -943,7 +939,7 @@ CudaRenderer::render() {
         printf("CUDA error: %s\n", cudaGetErrorString(error));
         fflush(stdout);
     }
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
 
     // for(int i = 0; i< (numCircles+SCAN_BLOCK_DIM)/SCAN_BLOCK_DIM; i++){
         

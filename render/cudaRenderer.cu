@@ -14,7 +14,7 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define SCAN_BLOCK_DIM   256
+#define SCAN_BLOCK_DIM   1024
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
 
@@ -390,6 +390,75 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     // END SHOULD-BE-ATOMIC REGION
 }
+__device__ __inline__ void
+shadePixel_2(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float rad_shared) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = rad_shared;//cuConstRendererParams.radius[circleIndex];;
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return;
+
+    float3 rgb;
+    float alpha;
+
+    // there is a non-zero contribution.  Now compute the shading value
+
+    // suggestion: This conditional is in the inner loop.  Although it
+    // will evaluate the same for all threads, there is overhead in
+    // setting up the lane masks etc to implement the conditional.  It
+    // would be wise to perform this logic outside of the loop next in
+    // kernelRenderCircles.  (If feeling good about yourself, you
+    // could use some specialized template magic).
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale = 4.f;
+
+        float normPixelDist = sqrt(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+
+        float maxAlpha = .6f + .4f * (1.f-p.z);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+    } else {
+        // simple: each circle has an assigned color
+        int index3 = 3 * circleIndex;
+        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        alpha = .5f;
+    }
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    // BEGIN SHOULD-BE-ATOMIC REGION
+    // global memory read
+
+    float4 existingColor = *imagePtr;
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x; // saxpy
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y; // saxpy
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z; // saxpy
+    newColor.w = alpha + existingColor.w;
+
+    // need to save 
+    // alpha - float
+    // rgb - float3
+    // float4 total same as image pointer
+
+    // *imagePtr can be changed to some local
+
+
+    // global memory write
+    *imagePtr = newColor;
+
+    // END SHOULD-BE-ATOMIC REGION
+}
 
 // kernelRenderCircles -- (CUDA device code)
 //
@@ -533,49 +602,51 @@ rendering(int circles_left, int iter){
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    __shared__ float3 shared_p[256];  // Shared memory for positions
-    // __shared__ float shared_rad[256]; // Shared memory for radii
-    __shared__ uint existence[256];
-    __shared__ uint prefixSumOutput[256];
-    __shared__ uint realOutput[256];
-    __shared__ uint prefixSumScratch[2 * 256];
+    __shared__ float3 shared_p[SCAN_BLOCK_DIM];  // Shared memory for positions
+    __shared__ float shared_rad[SCAN_BLOCK_DIM]; // Shared memory for radii
+    __shared__ uint existence[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint realOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
     int real_id = threadIdx.x + threadIdx.y * blockDim.x; // Between 0-255
     if(real_id < circles_left){
-        float3 p = *(float3*)(&cuConstRendererParams.position[3 * (iter * 256 + real_id)]);
-        float rad = cuConstRendererParams.radius[iter * 256 + real_id];
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * (iter * 1024 + real_id)]);
+        float rad = cuConstRendererParams.radius[iter * 1024 + real_id];
         float boxL = max(blockIdx.x * blockDim.x + 0.0,0.0);
         float boxB = max(blockIdx.y * blockDim.y + 0.0,0.0);
         float boxR = min(boxL + blockDim.x, 1024.0); 
         float boxT = min(boxB + blockDim.y, 1024.0);
 
         shared_p[real_id] = p;
-        // shared_rad[real_id] = rad;
-        existence[real_id] = circleInBoxConservative(p.x,p.y, rad, invWidth * boxL, invWidth * boxR, invHeight * boxT, invHeight * boxB);
+        shared_rad[real_id] = rad;
+        existence[real_id] = circleInBox(p.x,p.y, rad, invWidth * boxL, invWidth * boxR, invHeight * boxT, invHeight * boxB);
     }
     else{
         existence[real_id] = 0;
     }
     __syncthreads();
-    sharedMemExclusiveScan(real_id, existence, prefixSumOutput, prefixSumScratch, 256);
+    sharedMemExclusiveScan(real_id, existence, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
     //  if(blockIdx.x == 63 && blockIdx.y == 63){
     //         printf("pSum%i\n",prefixSumOutput[real_id]);
     //     }
     __syncthreads();
-    d_GatherIndices(real_id, prefixSumOutput, 256, existence, realOutput);
+    d_GatherIndices(real_id, prefixSumOutput, SCAN_BLOCK_DIM, existence, realOutput);
     __syncthreads();
-    int result = prefixSumOutput[255] + existence[255];
+    int result = prefixSumOutput[SCAN_BLOCK_DIM-1] + existence[SCAN_BLOCK_DIM-1];
 
     if(result>0){
         float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                     invHeight * (static_cast<float>(pixelY) + 0.5f));
         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]) + pixelX;
+        float4 temp = *imgPtr;
         for(int i = 0; i < result; i++){
-            shadePixel(realOutput[i]+iter*256, pixelCenterNorm, shared_p[realOutput[i]],imgPtr);
+            shadePixel_2(realOutput[i]+iter*SCAN_BLOCK_DIM, pixelCenterNorm, shared_p[realOutput[i]],&temp, shared_rad[realOutput[i]]);
         }
+        *imgPtr = temp;
     }
 }
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -802,12 +873,12 @@ CudaRenderer::render() {
     // Seperate 1024 x 1024 into 1024/sub_grid_height x 1024/sub_grid_height distinct sub_grid_heightxsub_grid_height grids
     // int subgrid_height = 16;
 
-    dim3 blockDim(16, 16, 1);
-    dim3 gridDim(64,64);
+    dim3 blockDim(32, 32, 1);
+    dim3 gridDim(32,32);
     // int circles_left= (numCircles<=256) ? numCircles : 256;
-    for(int i = 0; i< (numCircles+256)/256; i++){
+    for(int i = 0; i< (numCircles+SCAN_BLOCK_DIM)/SCAN_BLOCK_DIM; i++){
         
-        int circles_left = 256*i>(numCircles-256) ? numCircles%256 : 256;
+        int circles_left = SCAN_BLOCK_DIM*i>(numCircles-SCAN_BLOCK_DIM) ? numCircles%SCAN_BLOCK_DIM : SCAN_BLOCK_DIM;
         rendering<<<gridDim, blockDim>>>(circles_left, i);
         cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {

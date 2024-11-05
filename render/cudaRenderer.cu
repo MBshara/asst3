@@ -7,6 +7,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
 
 #include "cudaRenderer.h"
 #include "image.h"
@@ -711,6 +713,97 @@ rendering_2(int total_circles, int iterations){
         *imgPtr = temp;
     // }
 }
+
+__global__ void
+d_set_values(int size, int numCircles, int* input1){
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    for(int i = blockIdx.x; i<numCircles; i+=gridDim.x){
+        int temp = index + (i-blockIdx.x)*blockDim.x;
+        if(temp<size){
+            input[temp] =  i;
+        }
+    }
+}
+
+__global__ void
+d_find_values(int size, int numCircles, short* input){
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float boxL = max(threadIdx.x * blockDim.x + 0.0,0.0);
+    float boxB = max(threadIdx.y * blockDim.y + 0.0,0.0);
+    float boxR = min(boxL + blockDim.x, 1024.0); 
+    float boxT = min(boxB + blockDim.y, 1024.0);
+    boxL = invWidth * boxL;
+    boxR = invWidth * boxR;
+    boxT = invHeight * boxT;
+    boxB = invHeight * boxB;
+    int block_num = blockDim.x*blockDim.y;
+    int real_id = threadIdx.x + threadIdx.y * blockDim.x;
+    for(int i = blockIdx.x; i<numCircles; i+=gridDim.x){
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * i]);
+        float rad = cuConstRendererParams.radius[i];
+        int temp = real_id + (i-blockIdx.x)*blockDim.x*blockDim.y;
+        if(temp<size){
+            if(circleInBox(p.x, p.y, rad,  boxL, boxR, boxT, boxB) == 1){
+                input[temp] = real_id;
+            }
+            else{
+                input[temp] = block_num;
+            }
+        }
+    }
+}
+
+__global__ void
+rendering3(int* input, int* start, int* end){
+    int gridNum = blockIdx.x + blockIdx.y * gridDim.x;
+    int myStart = start[gridNum];
+    int myEnd = end[gridNum];
+
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth)]) + pixelX;
+    float4 temp = *imgPtr;
+
+    for(int i = myStart; i < myEnd; i++){
+        int circle_id = input[i];
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circle_id]);
+        shadePixel(circle_id, pixelCenterNorm, p, temp);
+    }
+
+    *imgPtr = temp;
+}
+
+__global__ void
+d_find_starts( int size, int numCircles, int* values, short* circles, int* start, int* end){
+    int real_id = blockIdx.x * blockDim.x + threadIdx.x;
+    for(int i = blockIdx.x; i<numCircles; i+=gridDim.x){
+        int temp = real_id + (i-blockIdx.x)*blockDim.x;
+        if(temp<size){
+            int this_cell = values[temp];
+            if(real_id == 0){
+                start[this_cell] = 0;
+            }
+            else if(this_cell != values[temp-1]){
+                if(this_cell!=1024){
+                    start[this_cell] = temp;
+                }
+                end[values[temp-1]] = temp;
+            }
+            if(this_cell!=1024 && temp == size-1){
+                end[this_cell] = temp+1;
+            }
+        }
+    }
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -722,6 +815,12 @@ CudaRenderer::CudaRenderer() {
     velocity = NULL;
     color = NULL;
     radius = NULL;
+
+    numGridBlocks = 1024;
+    cudaDeviceCircleLives = NULL;
+    cudaDeviceValuePairs = NULL;
+    cudaDeviceStart = NULL;
+    cudaDeviceEnd = NULL;
 
     cudaDevicePosition = NULL;
     cudaDeviceVelocity = NULL;
@@ -744,6 +843,10 @@ CudaRenderer::~CudaRenderer() {
     }
 
     if (cudaDevicePosition) {
+        cudaFree(cudaDeviceStart);
+        cudaFree(cudaDeviceEnd);
+        cudaFree(cudaDeviceValuePairs);
+        cudaFree(cudaDeviceCircleLives);
         cudaFree(cudaDevicePosition);
         cudaFree(cudaDeviceVelocity);
         cudaFree(cudaDeviceColor);
@@ -803,6 +906,12 @@ CudaRenderer::setup() {
     //
     // See the CUDA Programmer's Guide for descriptions of
     // cudaMalloc and cudaMemcpy
+
+    cudaMalloc(&cudaDeviceCircleLives, sizeof(short) * numGridBlocks * numCircles);
+    cudaMalloc(&cudaDeviceValuePairs, sizeof(int) * numGridBlocks * numCircles);
+    cudaMalloc(&cudaDeviceStart, sizeof(int) * numGridBlocks);
+    cudaMalloc(&cudaDeviceEnd, sizeof(int) * numGridBlocks);
+
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
@@ -918,6 +1027,34 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
+    // Find where each circle lives
+    // circle_living
+    // This needs at least numCircles * numGridBlocks entries
+    // Or numCircles * numGridBlocks * size(int or short)
+    
+    d_set_values<<<std::min(numCircles,40),numGridBlocks>>>(numCircles * numGridBlocks, numCircles, cudaDeviceValuePairs);
+
+    dim3 blockDim(32, 32, 1);
+    d_find_values<<<std::min(numCircles,40),blockDim>>>(numCircles * numGridBlocks, numCircles, cudaDeviceCircleLives);
+
+    // value_pairs
+    // We also need an array of equivalent size for the circles for the value pair
+    // numCircles * numGridBlocks * size(int or short) broken up into numGridBlocks of 0-numCircles
+
+    // We then run thrust sort stable to sort the value_pairs by circle_living
+    thrust::device_ptr<int> dev_circle_ptr(cudaDeviceValuePairs);
+    thrust::device_ptr<short> dev_index_ptr(cudaDeviceCircleLives);
+    thrust::stable_sort_by_key(dev_index_ptr, dev_index_ptr + numGridBlocks * numCircles, dev_circle_ptr, thrust::less<int>());
+
+    d_find_starts<<<std::min(numCircles,40),numGridBlocks>>>(numCircles * numGridBlocks, numCircles,cudaDeviceValuePairs, cudaDeviceCircleLives, cudaDeviceStart, cudaDeviceEnd);
+
+    // Then compute on each one.
+    dim3 blockDim(32, 32, 1);
+    dim3 gridDim(32,32);
+    rendering3<<<gridDim, blockDim>>>(cudaDeviceValuePairs, cudaDeviceStart, cudaDeviceEnd);
+}
+void
+CudaRenderer::render2() {
 
     // // 256 threads per block is a healthy number
     // dim3 blockDim(256, 1);

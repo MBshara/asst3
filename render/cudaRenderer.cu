@@ -725,6 +725,7 @@ rendering_2(){
     }
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -897,7 +898,7 @@ void
 CudaRenderer::clearImage() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(16, 16, 1);
+    dim3 blockDim(32, 32, 1);
     dim3 gridDim(
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);

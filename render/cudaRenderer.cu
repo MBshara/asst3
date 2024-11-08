@@ -657,6 +657,7 @@ rendering_2(){
     // x,y pixel I am computing on;
     // int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     // int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    int numCircles = cuConstRendererParams.numCircles;
     __shared__ uint existence[SCAN_BLOCK_DIM];
     __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
     __shared__ uint realOutput[SCAN_BLOCK_DIM];
@@ -687,16 +688,17 @@ rendering_2(){
     float4 temp = *imgPtr;
     float4 old_temp = temp;
 
-    int numCircles = cuConstRendererParams.numCircles;
-
     for(int iter = 0; iter<numCircles; iter+=SCAN_BLOCK_DIM){
 
         uint circle_id = iter + real_id;
         int update = 0;
         if(circle_id < numCircles){
+            // float2* pos = (float2*)(&cuConstRendererParams.position[3 * circle_id]);
             float3 p = *(float3*)(&cuConstRendererParams.position[3 * circle_id]);
             update = circleInBox(p.x, p.y, cuConstRendererParams.radius[circle_id],  boxL, boxR, boxT, boxB);
-            if (update) var = true;
+            if (update){
+                var = true;
+            }
         }
         existence[real_id] = update;
         // if update is 1 set var to 1.
@@ -705,12 +707,12 @@ rendering_2(){
             // Check if update is 1, if not then dont run the exclusive scan.
             sharedMemExclusiveScan(real_id, existence, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
             __syncthreads();
-            var = false;
             if(update){
+                var = false;
                 realOutput[prefixSumOutput[real_id]] = circle_id;
             }
-            __syncthreads();
             int result = existence[SCAN_BLOCK_DIM-1] + prefixSumOutput[SCAN_BLOCK_DIM-1];
+            __syncthreads();
             for(int i = 0; i < result; ++i){
                 int circle_id2 = realOutput[i];
                 shadePixel(circle_id2, pixelCenterNorm, *(float3*)(&cuConstRendererParams.position[3 * circle_id2]),&temp);
@@ -718,7 +720,7 @@ rendering_2(){
         }
     }
     // Good for micro
-    if(old_temp.x!=temp.x || old_temp.y!=temp.y || old_temp.z!=temp.z || old_temp.y!=temp.w){ 
+    if(old_temp.x!=temp.x || old_temp.y!=temp.y || old_temp.z!=temp.z || old_temp.w!=temp.w){ 
         *imgPtr = temp;
     }
 }
